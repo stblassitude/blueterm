@@ -1,0 +1,48 @@
+[package]
+name = "blueterm-agent"
+description = "BLE serial console agent: offers a login session over the Nordic UART Service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+blueterm-proto.workspace = true
+anyhow.workspace = true
+bluer.workspace = true
+clap.workspace = true
+futures.workspace = true
+rustix.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-journald.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.deb]
+maintainer = "Stefan Bethke <stb@lassitu.de>"
+copyright = "2026 Stefan Bethke"
+license-file = ["../../LICENSE", "0"]
+section = "admin"
+priority = "optional"
+depends = "$auto, bluez (>= 5.50)"
+extended-description = """\
+blueterm-agent advertises the Bluetooth Low Energy Nordic UART Service and \
+runs login(1) on a fresh pseudo-terminal for each connecting client, like a \
+serial console. By default only bonded, MITM-authenticated devices can start \
+a session; pair new devices with `sudo blueterm-agent pair`."""
+assets = [
+    ["target/release/blueterm-agent", "usr/bin/", "755"],
+    ["../../packaging/linux/agent.toml", "etc/blueterm/agent.toml", "644"],
+    ["../../README.md", "usr/share/doc/blueterm-agent/README.md", "644"],
+]
+conf-files = ["/etc/blueterm/agent.toml"]
+maintainer-scripts = "../../packaging/linux/debian"
+systemd-units = { unit-name = "blueterm-agent", unit-scripts = "../../packaging/linux", enable = true, start = true, restart-after-upgrade = true }

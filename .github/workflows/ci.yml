@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (fmt, clippy, test)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  macos:
+    name: macOS (clippy, test)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p blueterm -p blueterm-proto --all-targets -- -D warnings
+      - run: cargo test -p blueterm -p blueterm-proto
+      - name: Info.plist is embedded
+        run: |
+          cargo build -p blueterm
+          launchctl plist __TEXT,__info_plist target/debug/blueterm | grep NSBluetoothAlwaysUsageDescription
+
+  deb:
+    name: Debian packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config lintian
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb -p blueterm-agent
+      - run: cargo deb -p blueterm
+      - name: lintian (informational)
+        run: lintian --info target/debian/*.deb || true
+      - name: Install on Debian 12
+        run: |
+          docker run --rm -v "$PWD/target/debian:/debs:ro" debian:bookworm sh -ec '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /debs/*.deb
+            blueterm --version
+            blueterm-agent --version
+            test -f /usr/lib/systemd/system/blueterm-agent.service
+            test -f /etc/blueterm/agent.toml'

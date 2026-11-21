@@ -1,0 +1,3 @@
+Maintainer script templates for cargo-deb. cargo-deb generates the systemd
+snippets (enable/start/stop) into postinst/prerm/postrm; put custom scripts here
+to have them merged in.

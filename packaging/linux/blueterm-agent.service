@@ -1,0 +1,15 @@
+[Unit]
+Description=blueterm BLE serial console agent
+Documentation=https://github.com/stblassitude/blueterm
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/blueterm-agent run
+Restart=on-failure
+RestartSec=2
+# The agent must run as root to start login(1). Sessions need the real
+# filesystem (home directories, utmp), so systemd sandboxing is not used.
+
+[Install]
+WantedBy=multi-user.target

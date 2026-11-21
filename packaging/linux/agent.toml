@@ -1,0 +1,34 @@
+# blueterm-agent configuration.
+# After changing this file: systemctl restart blueterm-agent
+
+# Advertised name. Default: the hostname (truncated to 29 bytes).
+# name = "myhost"
+
+# Bluetooth adapter. Default: BlueZ's default adapter.
+# adapter = "hci0"
+
+# "authenticated": only bonded devices that paired with MITM protection can
+# start a session (pair with `sudo blueterm-agent pair`).
+# "open": no link security at all -- anyone in radio range gets a login
+# prompt. Only for bench testing.
+security = "authenticated"
+
+# Number of concurrent sessions. Advertising stops while all are in use.
+max_sessions = 1
+
+# Command run on the session's pty. It gets the pty as its controlling
+# terminal and stdin/stdout/stderr.
+login_command = ["/bin/login"]
+
+# Environment for the login command, in addition to TERM (which comes from
+# the client, or defaults to vt100).
+env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+
+# In "open" mode, how long to wait for a blueterm client's Hello before
+# starting a session for a generic NUS client with defaults (vt100, 80x24).
+hello_timeout_ms = 1000
+
+# A connected client that does not start a session within this many seconds
+# is disconnected. In "authenticated" mode a session starts with the first
+# (authenticated) write; generic NUS clients just press Enter.
+start_timeout_s = 60
