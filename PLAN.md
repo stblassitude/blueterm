@@ -497,7 +497,7 @@ is.
 |---|---|---|
 | lint | ubuntu-22.04 | `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` (proto, agent, client with Linux transport) |
 | test-linux | ubuntu-22.04 | `cargo test --workspace` |
-| test-macos | macos-14 | `cargo clippy -p blueterm -p blueterm-proto -- -D warnings`, `cargo test -p blueterm -p blueterm-proto` |
+| test-macos | macos-15 | `cargo clippy -p blueterm -p blueterm-proto -- -D warnings`, `cargo test -p blueterm -p blueterm-proto` |
 | deb-smoke | ubuntu-22.04 | `cargo deb -p blueterm-agent` and `cargo deb -p blueterm`, `lintian` (warnings allowed initially), `dpkg -i` of both in a `debian:bookworm` container to check installability |
 
 Cache with `Swatinem/rust-cache`. Pin the toolchain with `rust-toolchain.toml`.
@@ -508,7 +508,7 @@ Cache with `Swatinem/rust-cache`. Pin the toolchain with `rust-toolchain.toml`.
    - `cargo deb -p blueterm-agent` and `cargo deb -p blueterm`.
    - Optionally, a client tarball.
    - Upload the artifacts.
-2. `build-macos` on `macos-14`:
+2. `build-macos` on `macos-15`:
    - Build both targets and `lipo` them together.
    - Import the signing certificate into a temporary keychain.
    - `codesign`, then `codesign --verify --strict`, then
