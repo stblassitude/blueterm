@@ -12,7 +12,7 @@ env:
 
 jobs:
   check-version:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Tag matches Cargo version
@@ -134,7 +134,7 @@ jobs:
 
   release:
     needs: [linux, macos]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       id-token: write
