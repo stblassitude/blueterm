@@ -2,5 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "The Ubuntu runner is the glibc baseline for the .deb packages (libc6 dependency); bump it deliberately when the oldest supported distro changes.",
+      "matchDatasources": ["github-runners"],
+      "matchDepNames": ["ubuntu"],
+      "enabled": false
+    }
   ]
 }
