@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/blueterm-proto", "crates/blueterm-agent", "crates/blueterm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["Stefan Bethke"]
@@ -11,7 +11,7 @@ repository = "https://github.com/stblassitude/blueterm"
 rust-version = "1.88"
 
 [workspace.dependencies]
-blueterm-proto = { path = "crates/blueterm-proto", version = "0.1.0" }
+blueterm-proto = { path = "crates/blueterm-proto", version = "0.2.0" }
 anyhow = "1"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 btleplug = "0.13"
