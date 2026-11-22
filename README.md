@@ -96,6 +96,7 @@ Escape sequences work like ssh's and are recognized at the beginning of a line:
 | Keys | Action |
 |---|---|
 | `~.` | disconnect |
+| `~^Z` | suspend `blueterm` (resume with `fg`) |
 | `~?` | help |
 | `~~` | send a literal `~` |
 

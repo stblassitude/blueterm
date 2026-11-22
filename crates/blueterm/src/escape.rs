@@ -9,6 +9,8 @@ pub enum Action {
     Disconnect,
     /// `~?`: show help.
     Help,
+    /// `~^Z`: suspend the client.
+    Suspend,
 }
 
 pub struct Escaper {
@@ -16,6 +18,9 @@ pub struct Escaper {
     at_line_start: bool,
     pending: bool,
 }
+
+/// Ctrl-Z.
+const SUB: u8 = 0x1a;
 
 fn is_newline(b: u8) -> bool {
     b == b'\r' || b == b'\n'
@@ -42,18 +47,18 @@ impl Escaper {
             if self.pending {
                 self.pending = false;
                 match b {
+                    b if b == esc => out.push(esc),
                     b'.' => {
                         flush(&mut out, &mut actions);
                         actions.push(Action::Disconnect);
                         return actions;
                     }
-                    b'?' => {
+                    b'?' | SUB => {
                         flush(&mut out, &mut actions);
-                        actions.push(Action::Help);
+                        actions.push(if b == SUB { Action::Suspend } else { Action::Help });
                         self.at_line_start = true;
                         continue;
                     }
-                    b if b == esc => out.push(esc),
                     b => {
                         // Not an escape sequence: pass both through.
                         out.push(esc);
@@ -80,6 +85,7 @@ pub fn help_text(esc: u8) -> String {
     format!(
         "\r\nSupported escape sequences (at the start of a line):\r\n \
          {e}.   - disconnect\r\n \
+         {e}^Z  - suspend blueterm\r\n \
          {e}?   - this message\r\n \
          {e}{e}   - send the escape character\r\n"
     )
@@ -141,6 +147,18 @@ mod tests {
         let mut e = Escaper::new(Some(b'~'));
         // "~" + "\r" is not a sequence; both are sent and we are at a line start again.
         assert_eq!(e.feed(b"~\r~."), [send(b"~\r"), Action::Disconnect]);
+    }
+
+    #[test]
+    fn suspend_then_disconnect() {
+        let mut e = Escaper::new(Some(b'~'));
+        assert_eq!(e.feed(b"ls\r~\x1a~."), [send(b"ls\r"), Action::Suspend, Action::Disconnect]);
+    }
+
+    #[test]
+    fn ctrl_z_without_escape_passes_through() {
+        let mut e = Escaper::new(Some(b'~'));
+        assert_eq!(e.feed(b"\x1a"), [send(b"\x1a")]);
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub struct Io<R, W> {
     pub input: R,
     pub output: W,
     pub resize: mpsc::Receiver<(u16, u16)>,
+    /// Called for `~^Z`; returns once the process has been resumed.
+    pub suspend: Box<dyn FnMut() -> std::io::Result<()> + Send>,
 }
 
 pub async fn run<R, W>(
@@ -36,7 +38,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let Io { mut input, mut output, mut resize } = io;
+    let Io { mut input, mut output, mut resize, mut suspend } = io;
     let mut esc = Escaper::new(escape);
     let mut buf = vec![0u8; 1024];
     let mut input_open = true;
@@ -62,6 +64,11 @@ where
                         Action::Help => {
                             output.write_all(help_text(escape.unwrap_or(b'~')).as_bytes()).await?;
                             output.flush().await?;
+                        }
+                        Action::Suspend => {
+                            output.write_all(b"\r\n[suspend blueterm]\r\n").await?;
+                            output.flush().await?;
+                            suspend()?;
                         }
                     }
                 }
@@ -104,6 +111,7 @@ mod tests {
         from_client: mpsc::Receiver<Frame>,
         to_client: mpsc::Sender<Frame>,
         task: tokio::task::JoinHandle<Result<Outcome>>,
+        suspended: std::sync::mpsc::Receiver<()>,
     }
 
     fn start() -> Harness {
@@ -112,9 +120,15 @@ mod tests {
         let (resize, resize_rx) = mpsc::channel(4);
         let (tx, from_client) = mpsc::channel(16);
         let (to_client, mut rx) = mpsc::channel(16);
-        let task =
-            tokio::spawn(async move { run(&tx, &mut rx, Io { input, output, resize: resize_rx }, Some(b'~')).await });
-        Harness { keyboard, screen, resize, from_client, to_client, task }
+        let (suspended_tx, suspended) = std::sync::mpsc::channel();
+        let suspend = Box::new(move || {
+            let _ = suspended_tx.send(());
+            Ok(())
+        });
+        let task = tokio::spawn(async move {
+            run(&tx, &mut rx, Io { input, output, resize: resize_rx, suspend }, Some(b'~')).await
+        });
+        Harness { keyboard, screen, resize, from_client, to_client, task, suspended }
     }
 
     async fn outcome(h: Harness) -> Outcome {
@@ -150,6 +164,19 @@ mod tests {
         h.keyboard.write_all(b"\r~.").await.unwrap();
         assert_eq!(h.from_client.recv().await, Some(Frame::Data(b"\r".to_vec())));
         assert_eq!(outcome(h).await, Outcome::UserDisconnect);
+    }
+
+    #[tokio::test]
+    async fn escape_suspends() {
+        let mut h = start();
+        h.keyboard.write_all(b"~\x1aok").await.unwrap();
+        assert_eq!(h.from_client.recv().await, Some(Frame::Data(b"ok".to_vec())));
+        h.suspended.try_recv().expect("suspend was called");
+        let mut got = [0u8; 22];
+        h.screen.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"\r\n[suspend blueterm]\r\n");
+        h.to_client.send(Frame::Control(ControlMessage::SessionEnded { status: 0 })).await.unwrap();
+        assert_eq!(outcome(h).await, Outcome::Ended(0));
     }
 
     #[tokio::test]

@@ -2,7 +2,10 @@
 
 use std::os::fd::BorrowedFd;
 
-use rustix::termios::{OptionalActions, Termios, isatty, tcgetattr, tcgetwinsize, tcsetattr};
+use rustix::{
+    process::{Signal, getpid, kill_process},
+    termios::{OptionalActions, Termios, isatty, tcgetattr, tcgetwinsize, tcsetattr},
+};
 
 fn stdin_fd() -> BorrowedFd<'static> {
     // SAFETY: fd 0 stays open for the life of the process.
@@ -30,6 +33,7 @@ pub fn window_size() -> Option<(u16, u16)> {
 /// Puts stdin into raw mode; restores the previous mode when dropped.
 pub struct RawMode {
     saved: Termios,
+    raw: Termios,
 }
 
 impl RawMode {
@@ -45,8 +49,22 @@ impl RawMode {
             let _ = tcsetattr(stdin_fd(), OptionalActions::Now, &restore);
             prev(info);
         }));
-        Ok(RawMode { saved })
+        Ok(RawMode { saved, raw })
     }
+}
+
+/// Stops the process like ^Z in a shell would, with the terminal in its
+/// normal mode while we are stopped. Returns once we have been continued.
+pub fn suspend(raw: Option<&RawMode>) -> std::io::Result<()> {
+    if let Some(r) = raw {
+        tcsetattr(stdin_fd(), OptionalActions::Now, &r.saved)?;
+    }
+    // The default SIGTSTP action stops all threads; kill() returns after SIGCONT.
+    kill_process(getpid(), Signal::TSTP)?;
+    if let Some(r) = raw {
+        tcsetattr(stdin_fd(), OptionalActions::Now, &r.raw)?;
+    }
+    Ok(())
 }
 
 impl Drop for RawMode {

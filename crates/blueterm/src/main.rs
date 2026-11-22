@@ -73,7 +73,7 @@ struct ConnectArgs {
     /// Terminal type to request [default: $TERM]
     #[arg(long)]
     term: Option<String>,
-    /// Escape character, or "none"
+    /// Escape character (a character or ^X for a control character), or "none" to disable escapes
     #[arg(long, short, default_value = "~")]
     escape: String,
     /// How long to scan for the agent, in seconds.
@@ -194,6 +194,7 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
     }
 
     let (resize_tx, resize_rx) = mpsc::channel(4);
+    let resume_resize_tx = resize_tx.clone();
     let mut winch = signal(SignalKind::window_change()).context("installing SIGWINCH handler")?;
     tokio::spawn(async move {
         while winch.recv().await.is_some() {
@@ -207,9 +208,18 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
 
     let raw =
         if term::stdin_is_tty() { Some(term::RawMode::enable().context("setting terminal raw mode")?) } else { None };
-    let io = session::Io { input: tokio::io::stdin(), output: tokio::io::stdout(), resize: resize_rx };
+    // The closure owns the raw mode guard, so the terminal is restored when
+    // the session ends.
+    let suspend = Box::new(move || {
+        term::suspend(raw.as_ref())?;
+        // We miss SIGWINCH while stopped.
+        if let Some(size) = term::window_size() {
+            let _ = resume_resize_tx.try_send(size);
+        }
+        Ok(())
+    });
+    let io = session::Io { input: tokio::io::stdin(), output: tokio::io::stdout(), resize: resize_rx, suspend };
     let outcome = session::run(&link.tx, &mut link.rx, io, escape).await;
-    drop(raw);
 
     let transport::Link { tx, rx, task, .. } = link;
     drop((tx, rx));
