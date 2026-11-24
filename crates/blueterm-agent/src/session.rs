@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use blueterm_proto::{ControlMessage, DEFAULT_SIZE, DEFAULT_TERM, Frame, PROTOCOL_VERSION};
+use blueterm_proto::{ACK_SECURE, ControlMessage, DEFAULT_SIZE, DEFAULT_TERM, Frame, PROTOCOL_VERSION};
 use rustix::process::Signal;
 use tokio::{
     sync::mpsc,
@@ -74,7 +74,8 @@ pub async fn run(cfg: &SessionConfig, mut link: Link) -> Result<()> {
     };
     info!(pid = child.id(), %term, rows, cols, "session started");
     if hello {
-        let ack = ControlMessage::HelloAck { version: PROTOCOL_VERSION, flags: 0 };
+        let flags = if cfg.require_write { ACK_SECURE } else { 0 };
+        let ack = ControlMessage::HelloAck { version: PROTOCOL_VERSION, flags };
         if link.tx.send(Frame::Control(ack)).await.is_err() {
             return hang_up(child).await;
         }
@@ -352,5 +353,19 @@ mod tests {
         assert!(out.contains("prompt") && out.contains("got=hi"), "{out:?}");
         assert_eq!(status, Some(3));
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_security_only_in_authenticated_mode() {
+        for (authenticated, expected) in [(true, ACK_SECURE), (false, 0)] {
+            let (link, mut c) = link();
+            let cfg = cfg("exit 0", authenticated);
+            let task = tokio::spawn(async move { run(&cfg, link).await });
+            c.to_agent.send(Frame::Control(ControlMessage::hello(24, 80, "vt100"))).await.unwrap();
+            let first = timeout(Duration::from_secs(5), c.from_agent.recv()).await.unwrap().unwrap();
+            let ack = ControlMessage::HelloAck { version: PROTOCOL_VERSION, flags: expected };
+            assert_eq!(first, Frame::Control(ack));
+            task.await.unwrap().unwrap();
+        }
     }
 }

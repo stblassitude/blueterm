@@ -1,14 +1,27 @@
 //! Relays between the local terminal and a [`Link`], independent of the BLE
 //! backend.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use blueterm_proto::{ControlMessage, Frame};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
+    time::timeout,
 };
 
 use crate::escape::{Action, Escaper, help_text};
+
+/// Waits a moment for the agent's `HelloAck`. Returns its flags, and the frame
+/// that arrived instead, if any, for [`Io::first`].
+pub async fn wait_for_ack(rx: &mut mpsc::Receiver<Frame>, limit: Duration) -> (Option<u8>, Option<Frame>) {
+    match timeout(limit, rx.recv()).await {
+        Ok(Some(Frame::Control(ControlMessage::HelloAck { flags, .. }))) => (Some(flags), None),
+        Ok(f) => (None, f),
+        Err(_) => (None, None),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -24,6 +37,8 @@ pub struct Io<R, W> {
     pub input: R,
     pub output: W,
     pub resize: mpsc::Receiver<(u16, u16)>,
+    /// A frame that was already received, handled before any others.
+    pub first: Option<Frame>,
     /// Called for `~^Z`; returns once the process has been resumed.
     pub suspend: Box<dyn FnMut() -> std::io::Result<()> + Send>,
 }
@@ -38,7 +53,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let Io { mut input, mut output, mut resize, mut suspend } = io;
+    let Io { mut input, mut output, mut resize, mut first, mut suspend } = io;
     let mut esc = Escaper::new(escape);
     let mut buf = vec![0u8; 1024];
     let mut input_open = true;
@@ -73,7 +88,7 @@ where
                     }
                 }
             }
-            f = rx.recv() => match f {
+            f = async { if first.is_some() { first.take() } else { rx.recv().await } } => match f {
                 None => return Ok(Outcome::Lost),
                 Some(Frame::Data(d)) => {
                     output.write_all(&d).await?;
@@ -101,8 +116,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::{io::duplex, time::timeout};
+    use tokio::io::duplex;
 
     struct Harness {
         keyboard: tokio::io::DuplexStream,
@@ -126,7 +140,7 @@ mod tests {
             Ok(())
         });
         let task = tokio::spawn(async move {
-            run(&tx, &mut rx, Io { input, output, resize: resize_rx, suspend }, Some(b'~')).await
+            run(&tx, &mut rx, Io { input, output, resize: resize_rx, first: None, suspend }, Some(b'~')).await
         });
         Harness { keyboard, screen, resize, from_client, to_client, task, suspended }
     }
@@ -190,5 +204,33 @@ mod tests {
         assert_eq!(&got, b"still here");
         h.to_client.send(Frame::Control(ControlMessage::SessionEnded { status: 0 })).await.unwrap();
         assert_eq!(outcome(h).await, Outcome::Ended(0));
+    }
+
+    #[tokio::test]
+    async fn ack_is_consumed_and_other_frames_are_kept() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let limit = Duration::from_millis(50);
+        tx.send(Frame::Control(ControlMessage::HelloAck { version: 1, flags: 1 })).await.unwrap();
+        assert_eq!(wait_for_ack(&mut rx, limit).await, (Some(1), None));
+        assert_eq!(wait_for_ack(&mut rx, limit).await, (None, None)); // timed out
+        tx.send(Frame::Data(b"hi".to_vec())).await.unwrap();
+        assert_eq!(wait_for_ack(&mut rx, limit).await, (None, Some(Frame::Data(b"hi".to_vec()))));
+    }
+
+    #[tokio::test]
+    async fn first_frame_is_handled_before_others() {
+        let (_keyboard, input) = duplex(64);
+        let (output, mut screen) = duplex(64);
+        let (_resize_tx, resize) = mpsc::channel(1);
+        let (tx, _from_client) = mpsc::channel(4);
+        let (to_client, mut rx) = mpsc::channel(4);
+        to_client.send(Frame::Data(b"two".to_vec())).await.unwrap();
+        to_client.send(Frame::Control(ControlMessage::SessionEnded { status: 0 })).await.unwrap();
+        let first = Some(Frame::Data(b"one".to_vec()));
+        let io = Io { input, output, resize, first, suspend: Box::new(|| Ok(())) };
+        assert_eq!(run(&tx, &mut rx, io, None).await.unwrap(), Outcome::Ended(0));
+        let mut out = String::new();
+        screen.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "onetwo");
     }
 }

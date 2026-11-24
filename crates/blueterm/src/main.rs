@@ -8,7 +8,7 @@ mod transport;
 use std::{process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use blueterm_proto::{ControlMessage, DEFAULT_SIZE, DEFAULT_TERM, is_valid_term};
+use blueterm_proto::{ACK_SECURE, ControlMessage, DEFAULT_SIZE, DEFAULT_TERM, is_valid_term};
 use clap::{Args, Parser, Subcommand};
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -164,6 +164,9 @@ async fn pair(_opts: &Options, _target: &str, _scan_timeout: Duration) -> Result
     )
 }
 
+/// How long to wait for the agent's reply before showing the "Connected" line.
+const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn parse_escape(s: &str) -> Result<Option<u8>> {
     match s {
         "none" => Ok(None),
@@ -190,13 +193,16 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
     let name = found.display_name().to_owned();
     eprintln!("Connecting to {name} ({})...", found.id);
     let mut link = backend.connect(&found, &ControlMessage::hello(rows, cols, term)).await?;
+    let (ack, first) =
+        if link.has_control { session::wait_for_ack(&mut link.rx, ACK_TIMEOUT).await } else { (None, None) };
+    let security = describe_security(ack);
     match escape {
         Some(e) => eprintln!(
-            "Connected to {name}. Escape character is '{}'; type {}? for help.",
+            "Connected to {name} ({security}). Escape character is '{}'; type {}? for help.",
             escape_name(e),
             escape_name(e)
         ),
-        None => eprintln!("Connected to {name}."),
+        None => eprintln!("Connected to {name} ({security})."),
     }
     if !link.has_control {
         eprintln!("(Plain NUS device: no window size or exit status. Press Enter for a prompt.)");
@@ -227,7 +233,7 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
         }
         Ok(())
     });
-    let io = session::Io { input: tokio::io::stdin(), output: tokio::io::stdout(), resize: resize_rx, suspend };
+    let io = session::Io { input: tokio::io::stdin(), output: tokio::io::stdout(), resize: resize_rx, first, suspend };
     let outcome = session::run(&link.tx, &mut link.rx, io, escape).await;
 
     let transport::Link { tx, rx, task, .. } = link;
@@ -250,6 +256,15 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
     })
 }
 
+/// Describes the link's security as far as we know. The Bluetooth APIs do not
+/// tell us, so this is only what the agent says.
+fn describe_security(ack_flags: Option<u8>) -> &'static str {
+    match ack_flags {
+        Some(f) if f & ACK_SECURE != 0 => "agent reports: encrypted, authenticated",
+        _ => "encryption: not reported by agent",
+    }
+}
+
 fn escape_name(e: u8) -> String {
     if e < 0x20 { format!("^{}", (e | 0x40) as char) } else { (e as char).to_string() }
 }
@@ -267,6 +282,15 @@ mod tests {
         assert!(parse_escape("ab").is_err());
         assert_eq!(escape_name(0x1d), "^]");
         assert_eq!(escape_name(b'~'), "~");
+    }
+
+    #[test]
+    fn security_is_only_claimed_if_reported() {
+        assert!(describe_security(Some(ACK_SECURE)).contains("encrypted, authenticated"));
+        assert!(describe_security(Some(ACK_SECURE | 0x80)).contains("encrypted, authenticated"));
+        for unknown in [None, Some(0), Some(0x80)] {
+            assert!(describe_security(unknown).contains("not reported"));
+        }
     }
 
     #[test]

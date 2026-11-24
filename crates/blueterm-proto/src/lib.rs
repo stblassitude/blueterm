@@ -22,6 +22,12 @@ pub const CONTROL: Uuid = Uuid::from_u128(0x37b7340b_aa46_4885_b0b3_2a07e496dc05
 /// Version of the control protocol spoken by this build.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Flag in [`ControlMessage::HelloAck`]: the agent only accepts writes over an
+/// encrypted link from a device paired with MITM protection, so the `Hello` it
+/// is replying to arrived that way. Agents before 1.0 never set it. The client
+/// cannot verify it: anyone could send it.
+pub const ACK_SECURE: u8 = 0x01;
+
 /// Smallest possible ATT payload (ATT_MTU 23 minus 3 bytes of header).
 pub const MIN_PAYLOAD: usize = 20;
 
@@ -50,7 +56,7 @@ pub enum ControlMessage {
     Hello { version: u8, rows: u16, cols: u16, term: String },
     /// Client → agent, terminal window changed.
     Resize { rows: u16, cols: u16 },
-    /// Agent → client, reply to `Hello`.
+    /// Agent → client, reply to `Hello`. `flags` is a combination of `ACK_*`.
     HelloAck { version: u8, flags: u8 },
     /// Agent → client, the login session has ended.
     SessionEnded { status: i32 },
@@ -187,6 +193,7 @@ mod tests {
         roundtrip(ControlMessage::hello(50, 132, "xterm-256color"));
         roundtrip(ControlMessage::Resize { rows: 1, cols: 65535 });
         roundtrip(ControlMessage::HelloAck { version: 1, flags: 0 });
+        roundtrip(ControlMessage::HelloAck { version: 1, flags: ACK_SECURE });
         roundtrip(ControlMessage::SessionEnded { status: -1 });
         roundtrip(ControlMessage::SessionEnded { status: 130 });
         roundtrip(ControlMessage::Error("boom".into()));
