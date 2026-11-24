@@ -40,6 +40,11 @@ pub struct SessionConfig {
 /// How long to keep relaying output after the login process exited, to
 /// flush what it wrote last.
 const DRAIN_TIME: Duration = Duration::from_millis(300);
+/// How long the terminal may stay closed while the login process is running.
+/// login(1) calls vhangup() and opens its terminal again.
+const REOPEN_GRACE: Duration = Duration::from_secs(3);
+/// How often to check whether the terminal has been opened again.
+const REOPEN_POLL: Duration = Duration::from_millis(20);
 /// How long to wait for the session's processes after hanging up.
 const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
@@ -59,7 +64,7 @@ pub async fn run(cfg: &SessionConfig, mut link: Link) -> Result<()> {
 
     let mut env = cfg.env.clone();
     env.push(("TERM".into(), term.clone()));
-    let pty::Spawned { pty, mut child } = match pty::spawn(&cfg.login_command, &env, rows, cols) {
+    let pty::Spawned { mut pty, mut child } = match pty::spawn(&cfg.login_command, &env, rows, cols) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("cannot start {:?}: {e}", cfg.login_command[0]);
@@ -78,12 +83,28 @@ pub async fn run(cfg: &SessionConfig, mut link: Link) -> Result<()> {
     let mut buf = vec![0u8; 4096];
     let mut exit_status = None;
     let mut drain_until = None;
+    // While the terminal is closed: when that began, and the last check.
+    let mut closed: Option<(Instant, Instant)> = None;
+    let mut read_again = None;
     loop {
         tokio::select! {
-            r = pty.read(&mut buf) => {
+            r = pty.read(&mut buf), if read_again.is_none() => {
                 let n = r.context("reading pty")?;
                 if n == 0 {
-                    break; // every process holding the terminal is gone
+                    if exit_status.is_some() {
+                        break; // every process holding the terminal is gone
+                    }
+                    let now = Instant::now();
+                    let since = match closed {
+                        Some((since, last)) if now - last < REOPEN_POLL * 10 => since,
+                        _ => now, // it was open in between
+                    };
+                    if now - since >= REOPEN_GRACE {
+                        break;
+                    }
+                    closed = Some((since, now));
+                    read_again = Some(now + REOPEN_POLL);
+                    continue;
                 }
                 if link.tx.send(Frame::Data(buf[..n].to_vec())).await.is_err() {
                     return hang_up(child).await;
@@ -104,6 +125,7 @@ pub async fn run(cfg: &SessionConfig, mut link: Link) -> Result<()> {
                 }
                 Some(Frame::Control(m)) => debug!(?m, "ignoring control message"),
             },
+            _ = sleep_until(read_again.unwrap_or_else(Instant::now)), if read_again.is_some() => read_again = None,
             st = child.wait(), if exit_status.is_none() => {
                 exit_status = Some(st.context("waiting for login process")?);
                 drain_until = Some(Instant::now() + DRAIN_TIME);
@@ -304,5 +326,31 @@ mod tests {
         let f = timeout(Duration::from_secs(5), c.from_agent.recv()).await.unwrap().unwrap();
         assert!(matches!(f, Frame::Control(ControlMessage::Error(_))), "{f:?}");
         assert!(task.await.unwrap().is_err());
+    }
+
+    /// login(1) from util-linux calls vhangup() and then reopens the terminal.
+    /// In between, nobody has it open and reading the master fails with EIO.
+    #[tokio::test]
+    async fn survives_terminal_being_reopened() {
+        let (link, mut c) = link();
+        let cmd =
+            "t=$(tty); exec 0<&- 1>&- 2>&-; sleep 0.2; exec 0<>$t 1>&0 2>&0; echo prompt; read x; echo got=$x; exit 3";
+        let cfg = cfg(cmd, true);
+        let task = tokio::spawn(async move { run(&cfg, link).await });
+        c.to_agent
+            .send(Frame::Control(ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                rows: 24,
+                cols: 80,
+                term: "vt100".into(),
+            }))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(600)).await;
+        let _ = c.to_agent.send(Frame::Data(b"hi\n".to_vec())).await;
+        let (out, status) = collect(&mut c).await;
+        assert!(out.contains("prompt") && out.contains("got=hi"), "{out:?}");
+        assert_eq!(status, Some(3));
+        task.await.unwrap().unwrap();
     }
 }

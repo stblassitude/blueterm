@@ -15,7 +15,9 @@ use tokio::{io::unix::AsyncFd, process::Child};
 
 /// The master side of a pty with a child process attached to the slave.
 pub struct Pty {
-    master: AsyncFd<OwnedFd>,
+    master: OwnedFd,
+    /// Duplicate of `master`, registered with tokio.
+    ready: AsyncFd<OwnedFd>,
 }
 
 pub struct Spawned {
@@ -61,35 +63,61 @@ pub fn spawn(cmd: &[String], env: &[(String, String)], rows: u16, cols: u16) -> 
     // reading the master reports EOF once the session's processes are gone.
     drop(command);
 
-    // SAFETY: `master` is an open fd owned by the AsyncFd for its whole
+    let ready = register(&master)?;
+    Ok(Spawned { pty: Pty { master, ready }, child })
+}
+
+fn register(master: &OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
+    let fd = master.try_clone()?;
+    // SAFETY: `fd` is an open fd owned by the AsyncFd for its whole
     // lifetime; OwnedFd always reports the same raw fd.
-    let master = unsafe { AsyncFd::register(master) }.map_err(|e| e.into_parts().1)?;
-    Ok(Spawned { pty: Pty { master }, child })
+    unsafe { AsyncFd::register(fd) }.map_err(|e| e.into_parts().1)
 }
 
 impl Pty {
-    /// Reads from the master. Returns 0 once no process holds the slave open
-    /// any more (Linux reports that as EIO).
-    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    /// Reads from the master. Returns 0 while no process holds the slave open
+    /// (Linux reports that as EIO). That is not necessarily the end: login(1)
+    /// closes and reopens its terminal. The caller may read again, but should
+    /// pause first, because this does not wait for the slave to be opened.
+    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let mut guard = self.master.readable().await?;
+            let mut guard = self.ready.readable().await?;
+            let hung_up = guard.ready().is_read_closed();
             match guard.try_io(|fd| rustix::io::read(fd, &mut *buf).map_err(io::Error::from)) {
-                Ok(Ok(n)) => return Ok(n),
-                Ok(Err(e)) if e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => return Ok(0),
-                Ok(Err(e)) => return Err(e),
-                Err(_would_block) => continue,
+                Ok(Err(e)) if is_eio(&e) => return Ok(0),
+                Ok(r) => return r,
+                Err(_would_block) => {
+                    drop(guard);
+                    self.after_would_block(hung_up)?;
+                }
             }
         }
     }
 
-    pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+    /// Writes to the master. Input is discarded while no process holds the
+    /// slave open.
+    pub async fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {
-            let mut guard = self.master.writable().await?;
+            let mut guard = self.ready.writable().await?;
+            let hung_up = guard.ready().is_write_closed();
             match guard.try_io(|fd| rustix::io::write(fd, buf).map_err(io::Error::from)) {
                 Ok(Ok(n)) => buf = &buf[n..],
+                Ok(Err(e)) if is_eio(&e) => return Ok(()),
                 Ok(Err(e)) => return Err(e),
-                Err(_would_block) => continue,
+                Err(_would_block) => {
+                    drop(guard);
+                    self.after_would_block(hung_up)?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// tokio never clears a hang-up: the fd would stay "ready" forever and we
+    /// would spin. If the slave has been opened again, start afresh.
+    fn after_would_block(&mut self, hung_up: bool) -> io::Result<()> {
+        if hung_up {
+            self.ready = register(&self.master)?;
         }
         Ok(())
     }
@@ -97,9 +125,13 @@ impl Pty {
     /// Sets the window size; the kernel sends SIGWINCH to the foreground
     /// process group.
     pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
-        rustix::termios::tcsetwinsize(self.master.get_ref().as_fd(), winsize(rows, cols))?;
+        rustix::termios::tcsetwinsize(self.master.as_fd(), winsize(rows, cols))?;
         Ok(())
     }
+}
+
+fn is_eio(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
 }
 
 /// Sends `sig` to the process group led by `child` (it is a session leader,
