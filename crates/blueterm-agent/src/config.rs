@@ -117,6 +117,8 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.security, Security::Authenticated);
         assert_eq!(cfg.login_command, ["/bin/login"]);
+        assert_eq!(cfg.max_sessions, Config::default().max_sessions);
+        assert_eq!(cfg.max_sessions, 1);
     }
 
     #[test]

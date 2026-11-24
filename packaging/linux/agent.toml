@@ -14,6 +14,8 @@
 security = "authenticated"
 
 # Number of concurrent sessions. Advertising stops while all are in use.
+# With more than 1, a paired device other than a Mac running blueterm may get
+# no login prompt if it reconnects while another session is still open.
 max_sessions = 1
 
 # Command run on the session's pty. It gets the pty as its controlling

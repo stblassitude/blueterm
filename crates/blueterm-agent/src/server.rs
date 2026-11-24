@@ -2,7 +2,7 @@
 //! task per remote device that bridges BlueZ's per-device sockets to a
 //! [`session`](crate::session).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::NonZeroU16, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use bluer::{
@@ -11,9 +11,9 @@ use bluer::{
     gatt::{
         CharacteristicReader, CharacteristicWriter,
         local::{
-            Application, Characteristic, CharacteristicControl, CharacteristicControlEvent, CharacteristicNotify,
-            CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteIoRequest, CharacteristicWriteMethod,
-            ReqError, Service, characteristic_control,
+            Application, ApplicationHandle, Characteristic, CharacteristicControl, CharacteristicControlEvent,
+            CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteIoRequest,
+            CharacteristicWriteMethod, ReqError, Service, ServiceControl, characteristic_control, service_control,
         },
     },
 };
@@ -109,52 +109,18 @@ pub async fn run(cfg: Config) -> Result<()> {
         start_timeout: cfg.start_timeout(),
     });
 
-    let (rx_ctl, rx_handle) = characteristic_control();
-    let (tx_ctl, tx_handle) = characteristic_control();
-    let (ctrl_ctl, ctrl_handle) = characteristic_control();
-    let app = Application {
-        services: vec![Service {
-            uuid: NUS_SERVICE,
-            primary: true,
-            characteristics: vec![
-                Characteristic {
-                    uuid: NUS_RX,
-                    write: Some(write_props(secure)),
-                    control_handle: rx_handle,
-                    ..Default::default()
-                },
-                Characteristic {
-                    uuid: NUS_TX,
-                    notify: Some(notify_props()),
-                    control_handle: tx_handle,
-                    ..Default::default()
-                },
-                Characteristic {
-                    uuid: CONTROL,
-                    write: Some(write_props(secure)),
-                    notify: Some(notify_props()),
-                    control_handle: ctrl_handle,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let _app = adapter.serve_gatt_application(app).await.context("registering GATT application")?;
+    let mut gatt = Gatt::register(&adapter, secure, None).await.context("registering GATT application")?;
 
     let mut adv = Some(advertise(&adapter, &name).await?);
     info!(adapter = adapter.name(), address = %adapter.address().await?, %name, ?cfg.security, "ready");
 
     let (done_tx, mut done_rx) = mpsc::channel::<Address>(8);
     let mut conns: HashMap<Address, mpsc::Sender<Part>> = HashMap::new();
-    let mut controls: [(Kind, CharacteristicControl); 3] =
-        [(Kind::Data, rx_ctl), (Kind::Data, tx_ctl), (Kind::Control, ctrl_ctl)];
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
     loop {
-        let [(k0, c0), (k1, c1), (k2, c2)] = &mut controls;
+        let [(k0, c0), (k1, c1), (k2, c2)] = &mut gatt.controls;
         let ev = tokio::select! {
             Some(ev) = c0.next() => map_event(*k0, ev),
             Some(ev) = c1.next() => map_event(*k1, ev),
@@ -162,6 +128,17 @@ pub async fn run(cfg: Config) -> Result<()> {
             Some(addr) = done_rx.recv() => {
                 if conns.get(&addr).is_some_and(|s| s.is_closed()) {
                     conns.remove(&addr);
+                }
+                conns.retain(|_, s| !s.is_closed());
+                if conns.is_empty() {
+                    // BlueZ remembers a bonded device's notification
+                    // subscriptions after it disconnects, and ignores the
+                    // client re-subscribing on its next connection. Then it
+                    // never calls AcquireNotify, we get no notify socket, and
+                    // the session cannot start. Re-registering the service
+                    // makes BlueZ forget those subscriptions.
+                    adv = None;
+                    gatt = gatt.reregister(&adapter, secure).await.context("re-registering GATT application")?;
                 }
                 if adv.is_none() && conns.len() < cfg.max_sessions {
                     adv = Some(advertise(&adapter, &name).await?);
@@ -217,12 +194,100 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+/// Our registered GATT application.
+struct Gatt {
+    _app: ApplicationHandle,
+    /// Tells us the handle BlueZ assigned to the NUS service.
+    service: ServiceControl,
+    controls: [(Kind, CharacteristicControl); 3],
+}
+
+impl Gatt {
+    /// Registers the NUS service, at `service_handle` if given.
+    async fn register(adapter: &Adapter, secure: bool, service_handle: Option<NonZeroU16>) -> Result<Gatt> {
+        let (service_ctl, service_ctl_handle) = service_control();
+        let (rx_ctl, rx_handle) = characteristic_control();
+        let (tx_ctl, tx_handle) = characteristic_control();
+        let (ctrl_ctl, ctrl_handle) = characteristic_control();
+        let app = Application {
+            services: vec![Service {
+                uuid: NUS_SERVICE,
+                handle: service_handle,
+                primary: true,
+                characteristics: vec![
+                    Characteristic {
+                        uuid: NUS_RX,
+                        write: Some(write_props(secure)),
+                        control_handle: rx_handle,
+                        ..Default::default()
+                    },
+                    Characteristic {
+                        uuid: NUS_TX,
+                        notify: Some(notify_props()),
+                        control_handle: tx_handle,
+                        ..Default::default()
+                    },
+                    Characteristic {
+                        uuid: CONTROL,
+                        write: Some(write_props(secure)),
+                        notify: Some(notify_props()),
+                        control_handle: ctrl_handle,
+                        ..Default::default()
+                    },
+                ],
+                control_handle: service_ctl_handle,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let app = adapter.serve_gatt_application(app).await?;
+        Ok(Gatt {
+            _app: app,
+            service: service_ctl,
+            controls: [(Kind::Data, rx_ctl), (Kind::Data, tx_ctl), (Kind::Control, ctrl_ctl)],
+        })
+    }
+
+    /// Unregisters the application and registers it again. BlueZ drops all
+    /// per-device state of a service it removes, including the notification
+    /// subscriptions of bonded devices.
+    ///
+    /// The service gets its old handle back, so the attribute database looks
+    /// exactly as before. Clients that cache it (macOS does, for bonded
+    /// devices) are not confused.
+    async fn reregister(self, adapter: &Adapter, secure: bool) -> Result<Gatt> {
+        let service_handle = self.service.handle().ok();
+        debug!(?service_handle, "re-registering GATT application");
+        // bluer unregisters in the background once the handle is dropped.
+        // Until BlueZ has removed the old service, its handles are taken
+        // and registering at the same handle fails, so retry for a bit.
+        drop(self);
+        let mut attempt = 0;
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            match Gatt::register(adapter, secure, service_handle).await {
+                Ok(g) => return Ok(g),
+                Err(e) if attempt < 20 => {
+                    debug!("registering GATT application failed, retrying: {e}");
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 async fn advertise(adapter: &Adapter, name: &str) -> Result<AdvertisementHandle> {
     let adv = Advertisement {
         advertisement_type: AdvType::Peripheral,
         service_uuids: [NUS_SERVICE].into_iter().collect(),
         local_name: Some(name.to_owned()),
         discoverable: Some(true),
+        // BlueZ's default of 1.28 s is so slow that a short scan, especially
+        // by macOS, often misses us. Apple recommends 152.5 ms for quick
+        // discovery.
+        min_interval: Some(Duration::from_millis(100)),
+        max_interval: Some(Duration::from_millis(150)),
         ..Default::default()
     };
     adapter.advertise(adv).await.context("registering LE advertisement")
