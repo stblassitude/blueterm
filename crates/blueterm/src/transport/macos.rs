@@ -16,6 +16,11 @@ use uuid::Uuid;
 use super::{Found, Link, Options, chunks};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Start a fresh scan if the current one has found nothing for this long.
+/// Scans sometimes miss an agent that the next scan sees right away.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// How long CoreBluetooth may take to switch notifications on or off.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// ATT header of a Write Command.
 const ATT_WRITE_HEADER: usize = 3;
 
@@ -64,13 +69,27 @@ impl Backend {
     }
 
     pub async fn discover(&self, limit: Duration, mut stop: impl FnMut(&[Found]) -> bool) -> Result<Vec<Found>> {
-        self.adapter.start_scan(ScanFilter { services: vec![NUS_SERVICE] }).await.map_err(map_err)?;
-        let deadline = tokio::time::Instant::now() + limit;
+        let filter = ScanFilter { services: vec![NUS_SERVICE] };
+        self.adapter.start_scan(filter.clone()).await.map_err(map_err)?;
+        let started = tokio::time::Instant::now();
+        let mut scan_started = started;
+        let mut seen = 0;
         let result = loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let list = self.collect().await?;
-            if stop(&list) || tokio::time::Instant::now() >= deadline {
+            if list.len() > seen {
+                seen = list.len();
+                debug!(elapsed = ?started.elapsed(), agents = seen, "agent found");
+            }
+            if stop(&list) || started.elapsed() >= limit {
+                debug!(elapsed = ?started.elapsed(), agents = list.len(), "scan finished");
                 break list;
+            }
+            if list.is_empty() && scan_started.elapsed() >= RESCAN_INTERVAL {
+                debug!(elapsed = ?started.elapsed(), "nothing found, restarting scan");
+                let _ = self.adapter.stop_scan().await;
+                self.adapter.start_scan(filter.clone()).await.map_err(map_err)?;
+                scan_started = tokio::time::Instant::now();
             }
         };
         let _ = self.adapter.stop_scan().await;
@@ -116,6 +135,23 @@ fn find(p: &Peripheral, uuid: Uuid) -> Option<Characteristic> {
     p.characteristics().into_iter().find(|c| c.uuid == uuid && c.service_uuid == NUS_SERVICE)
 }
 
+/// Switches notifications for `c` off, then on.
+///
+/// BlueZ remembers a bonded device's subscriptions after it disconnects. When
+/// the device subscribes again on its next connection, BlueZ sees no change
+/// and does not tell the agent, which then never starts a session. Switching
+/// off first makes the subscription a change again. The agent works around
+/// this itself when it is idle, but not while other sessions are running.
+async fn subscribe_fresh(p: &Peripheral, c: &Characteristic) -> Result<()> {
+    match timeout(SUBSCRIBE_TIMEOUT, p.unsubscribe(c)).await {
+        Ok(Ok(())) => {}
+        // Not fatal: subscribing may still work.
+        Ok(Err(e)) => debug!(uuid = %c.uuid, "unsubscribing failed: {e}"),
+        Err(_) => bail!("timed out switching notifications off"),
+    }
+    timeout(SUBSCRIBE_TIMEOUT, p.subscribe(c)).await.context("timed out")?.map_err(map_err)
+}
+
 async fn setup(
     p: &Peripheral,
     hello: &ControlMessage,
@@ -127,9 +163,9 @@ async fn setup(
     let ctrl_char = find(p, CONTROL);
 
     let mut notifications = p.notifications().await.map_err(map_err)?;
-    p.subscribe(&tx_char).await.map_err(map_err).context("subscribing to NUS TX")?;
+    subscribe_fresh(p, &tx_char).await.context("subscribing to NUS TX")?;
     if let Some(c) = &ctrl_char {
-        p.subscribe(c).await.map_err(map_err).context("subscribing to control characteristic")?;
+        subscribe_fresh(p, c).await.context("subscribing to control characteristic")?;
         // A write with response: if the agent requires an authenticated link,
         // macOS starts pairing here (the system shows a dialog).
         p.write(c, &hello.encode(), WriteType::WithResponse).await.map_err(|e| {
@@ -148,6 +184,7 @@ async fn setup(
     let p = p.clone();
     let id = p.id();
     let task = tokio::spawn(async move {
+        let mut gone = false;
         loop {
             tokio::select! {
                 n = notifications.next() => match n {
@@ -163,7 +200,10 @@ async fn setup(
                     Some(_) => {}
                 },
                 ev = events.next() => match ev {
-                    Some(CentralEvent::DeviceDisconnected(d)) if d == id => break,
+                    Some(CentralEvent::DeviceDisconnected(d)) if d == id => {
+                        gone = true;
+                        break;
+                    }
                     None => break,
                     _ => {}
                 },
@@ -191,7 +231,10 @@ async fn setup(
             }
         }
         drop(in_tx);
-        let _ = p.disconnect().await;
+        // The agent usually hangs up first when the session ends.
+        if !gone && p.is_connected().await.unwrap_or(false) {
+            let _ = p.disconnect().await;
+        }
     });
     Ok(Link { tx, rx, task, has_control })
 }
