@@ -84,7 +84,7 @@ pub async fn resolve(backend: &Backend, target: &str, timeout: Duration) -> Resu
         return Ok(matches.swap_remove(i));
     }
     match matches.len() {
-        0 => bail!("no blueterm agent named {target:?} found within {}s (try `blueterm scan`)", timeout.as_secs()),
+        0 => bail!("no blueterm agent named {target:?} found within {}s (try `blueterm --list`)", timeout.as_secs()),
         1 => Ok(matches.remove(0)),
         _ => {
             let list: Vec<String> = matches.iter().map(|f| format!("  {}", f.id)).collect();

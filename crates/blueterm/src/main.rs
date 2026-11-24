@@ -23,12 +23,16 @@ use crate::{
 
 /// Log in to a machine running blueterm-agent, over Bluetooth Low Energy.
 ///
-/// `blueterm <NAME>` connects to the agent advertising that name.
+/// `blueterm <NAME>` connects to the agent advertising that name;
+/// `blueterm -l` lists nearby agents.
 #[derive(Parser)]
 #[command(version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(flatten)]
     common: Common,
+    /// List nearby agents instead of connecting.
+    #[arg(short, long, visible_short_alias = 's', visible_alias = "scan", conflicts_with = "target")]
+    list: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
     #[command(flatten)]
@@ -48,12 +52,6 @@ struct Common {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List nearby agents.
-    Scan {
-        /// How long to scan, in seconds.
-        #[arg(long, short, default_value_t = 5)]
-        timeout: u64,
-    },
     /// Connect to an agent (default command).
     Connect(ConnectArgs),
     /// Pair with an agent (Linux; on macOS pairing happens on first connect).
@@ -68,7 +66,7 @@ enum Cmd {
 
 #[derive(Args, Clone)]
 struct ConnectArgs {
-    /// Agent name (as shown by `blueterm scan`) or id
+    /// Agent name (as shown by `blueterm --list`) or id
     target: Option<String>,
     /// Terminal type to request [default: $TERM]
     #[arg(long)]
@@ -76,15 +74,17 @@ struct ConnectArgs {
     /// Escape character (a character or ^X for a control character), or "none" to disable escapes
     #[arg(long, short, default_value = "~")]
     escape: String,
-    /// How long to scan for the agent, in seconds.
-    #[arg(long, default_value_t = 10)]
-    scan_timeout: u64,
+    /// How long to scan for the agent, in seconds [default: 10, or 5 with --list]
+    #[arg(long)]
+    scan_timeout: Option<u64>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let level = match cli.common.verbose {
-        0 => "warn",
+        // btleplug logs errors for harmless races, such as disconnecting
+        // when the agent has just hung up; they would garble the terminal.
+        0 => "warn,btleplug=off",
         1 => "blueterm=debug,info",
         _ => "trace",
     };
@@ -113,18 +113,27 @@ fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<i32> {
     let opts = Options { adapter: cli.common.adapter.clone() };
+    if cli.list {
+        return scan(&opts, cli.connect.scan_timeout).await;
+    }
     match cli.cmd {
-        Some(Cmd::Scan { timeout }) => scan(&opts, Duration::from_secs(timeout)).await,
         Some(Cmd::Connect(args)) => connect(&opts, args).await,
         Some(Cmd::Pair { target, scan_timeout }) => pair(&opts, &target, Duration::from_secs(scan_timeout)).await,
         None => connect(&opts, cli.connect).await,
     }
 }
 
-async fn scan(opts: &Options, timeout: Duration) -> Result<i32> {
+async fn scan(opts: &Options, timeout: Option<u64>) -> Result<i32> {
     let backend = Backend::new(opts).await?;
-    eprintln!("Scanning for {}s...", timeout.as_secs());
+    let secs = timeout.unwrap_or(5);
+    let timeout_given = timeout.is_some();
+    let timeout = Duration::from_secs(secs);
+    eprintln!("Scanning for {secs}s...");
     let mut found = backend.discover(timeout, |_| false).await?;
+    if found.is_empty() && !timeout_given {
+        eprintln!("Nothing found yet, scanning for another {secs}s...");
+        found = backend.discover(timeout, |_| false).await?;
+    }
     found.sort_by_key(|f| std::cmp::Reverse(f.rssi));
     if found.is_empty() {
         eprintln!("No agents found.");
@@ -168,7 +177,7 @@ fn parse_escape(s: &str) -> Result<Option<u8>> {
 
 async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
     let Some(target) = args.target else {
-        bail!("no agent given; usage: blueterm <NAME>  (see `blueterm scan` and `blueterm --help`)");
+        bail!("no agent given; usage: blueterm <NAME>  (see `blueterm --list` and `blueterm --help`)");
     };
     let escape = parse_escape(&args.escape)?;
     let term = args.term.or_else(|| std::env::var("TERM").ok()).filter(|t| is_valid_term(t));
@@ -177,7 +186,7 @@ async fn connect(opts: &Options, args: ConnectArgs) -> Result<i32> {
 
     let backend = Backend::new(opts).await?;
     eprintln!("Looking for {target}...");
-    let found = transport::resolve(&backend, &target, Duration::from_secs(args.scan_timeout)).await?;
+    let found = transport::resolve(&backend, &target, Duration::from_secs(args.scan_timeout.unwrap_or(10))).await?;
     let name = found.display_name().to_owned();
     eprintln!("Connecting to {name} ({})...", found.id);
     let mut link = backend.connect(&found, &ControlMessage::hello(rows, cols, term)).await?;
@@ -266,7 +275,15 @@ mod tests {
         Cli::command().debug_assert();
         let cli = Cli::try_parse_from(["blueterm", "myhost"]).unwrap();
         assert_eq!(cli.connect.target.as_deref(), Some("myhost"));
-        let cli = Cli::try_parse_from(["blueterm", "scan", "-t", "2"]).unwrap();
-        assert!(matches!(cli.cmd, Some(Cmd::Scan { timeout: 2 })));
+        for flag in ["-l", "-s", "--list", "--scan"] {
+            let cli = Cli::try_parse_from(["blueterm", flag]).unwrap();
+            assert!(cli.list && cli.cmd.is_none() && cli.connect.target.is_none());
+        }
+        let cli = Cli::try_parse_from(["blueterm", "-l", "--scan-timeout", "2"]).unwrap();
+        assert!(cli.list && cli.connect.scan_timeout == Some(2));
+        assert!(Cli::try_parse_from(["blueterm", "-l", "myhost"]).is_err());
+        // Not subcommands any more: these are agent names.
+        let cli = Cli::try_parse_from(["blueterm", "scan"]).unwrap();
+        assert_eq!(cli.connect.target.as_deref(), Some("scan"));
     }
 }
