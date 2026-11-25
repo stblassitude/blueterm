@@ -4,7 +4,7 @@ members = ["crates/blueterm-proto", "crates/blueterm-agent", "crates/blueterm"]
 exclude = ["third_party"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 license = "MIT"
 authors = ["Stefan Bethke"]
@@ -12,7 +12,7 @@ repository = "https://github.com/stblassitude/blueterm"
 rust-version = "1.88"
 
 [workspace.dependencies]
-blueterm-proto = { path = "crates/blueterm-proto", version = "1.0.0" }
+blueterm-proto = { path = "crates/blueterm-proto", version = "1.0.1" }
 anyhow = "1"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 btleplug = "0.13"

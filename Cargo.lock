@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "blueterm"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "bluer",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "blueterm-agent"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "bluer",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "blueterm-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "uuid",
 ]
