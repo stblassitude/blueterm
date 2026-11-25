@@ -23,6 +23,11 @@ tracing.workspace = true
 tracing-journald.workspace = true
 tracing-subscriber.workspace = true
 
+# For tests/object_order.rs. The versions must be the ones bluer uses.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+dbus = "0.9"
+dbus-crossroads = "0.5"
+
 [lints]
 workspace = true
 

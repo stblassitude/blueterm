@@ -6,7 +6,7 @@ use std::{collections::HashMap, num::NonZeroU16, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use bluer::{
-    Adapter, Address,
+    Adapter, Address, ErrorKind, InternalErrorKind,
     adv::{Advertisement, AdvertisementHandle, Type as AdvType},
     gatt::{
         CharacteristicReader, CharacteristicWriter,
@@ -23,7 +23,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::mpsc,
     task::JoinSet,
-    time::sleep,
+    time::{Instant, sleep},
 };
 use tracing::{debug, error, info, warn};
 
@@ -31,6 +31,10 @@ use crate::{
     config::{Config, Security},
     session::{self, Link, SessionConfig},
 };
+
+/// How long to keep trying to power on the adapter while BlueZ is busy.
+const POWER_ON_TIMEOUT: Duration = Duration::from_secs(10);
+const POWER_ON_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -95,10 +99,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         Some(name) => bt.adapter(name)?,
         None => bt.default_adapter().await.context("no Bluetooth adapter found")?,
     };
-    if !adapter.is_powered().await? {
-        info!(adapter = adapter.name(), "powering on adapter");
-        adapter.set_powered(true).await.context("powering on adapter (blocked by rfkill?)")?;
-    }
+    power_on(&adapter).await?;
 
     let name = cfg.advertised_name();
     let scfg = Arc::new(SessionConfig {
@@ -194,6 +195,38 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+/// Powers on the adapter if it is off.
+///
+/// At boot, bluetoothd powers on the adapter itself, and refuses our request
+/// as busy until it is done.
+async fn power_on(adapter: &Adapter) -> Result<()> {
+    if adapter.is_powered().await? {
+        return Ok(());
+    }
+    info!(adapter = adapter.name(), "powering on adapter");
+    let started = Instant::now();
+    loop {
+        match adapter.set_powered(true).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e.kind) && started.elapsed() < POWER_ON_TIMEOUT => {
+                debug!("powering on adapter failed, retrying: {e}");
+                sleep(POWER_ON_RETRY).await;
+            }
+            Err(e) => return Err(e).context("powering on adapter (blocked by rfkill?)"),
+        }
+    }
+}
+
+/// True if BlueZ refused a request because a similar one is in progress.
+fn is_busy(kind: &ErrorKind) -> bool {
+    match kind {
+        ErrorKind::InProgress => true,
+        // bluer has no error kind for this one.
+        ErrorKind::Internal(InternalErrorKind::DBus(name)) => name == "org.bluez.Error.Busy",
+        _ => false,
+    }
+}
+
 /// Our registered GATT application.
 struct Gatt {
     _app: ApplicationHandle,
@@ -252,9 +285,12 @@ impl Gatt {
     /// per-device state of a service it removes, including the notification
     /// subscriptions of bonded devices.
     ///
-    /// The service gets its old handle back, so the attribute database looks
-    /// exactly as before. Clients that cache it (macOS does, for bonded
-    /// devices) are not confused.
+    /// The service gets its old handle back, and its characteristics are
+    /// always registered in the same order (this needs our patched
+    /// dbus-crossroads), so the attribute database looks exactly as before.
+    /// Clients cache it (macOS does, for bonded devices), and we cannot rely
+    /// on BlueZ's Service Changed indication to tell them about changes:
+    /// macOS can miss it on the second connection after bluetoothd restarted.
     async fn reregister(self, adapter: &Adapter, secure: bool) -> Result<Gatt> {
         let service_handle = self.service.handle().ok();
         debug!(?service_handle, "re-registering GATT application");
@@ -425,5 +461,19 @@ async fn pump_reader(kind: Kind, r: CharacteristicReader, to_session: mpsc::Send
         if to_session.send(frame).await.is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_errors() {
+        let dbus = |name: &str| ErrorKind::Internal(InternalErrorKind::DBus(name.into()));
+        assert!(is_busy(&dbus("org.bluez.Error.Busy")));
+        assert!(is_busy(&ErrorKind::InProgress));
+        assert!(!is_busy(&dbus("org.bluez.Error.Blocked")));
+        assert!(!is_busy(&ErrorKind::Failed));
     }
 }

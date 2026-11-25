@@ -1,0 +1,24 @@
+[package]
+name = "dbus-crossroads"
+version = "0.5.3"
+authors = ["David Henningsson <diwic@ubuntu.com>"]
+edition = "2018"
+description = "Framework for writing D-Bus method handlers"
+repository = "https://github.com/diwic/dbus-rs/"
+license = "Apache-2.0/MIT"
+publish = false
+
+[lib]
+# The crate's own tests need a D-Bus session bus.
+test = false
+doctest = false
+
+[dependencies]
+dbus = "0.9.3"
+
+# Keep the upstream sources as they are.
+[lints.rust]
+warnings = "allow"
+
+[lints.clippy]
+all = "allow"

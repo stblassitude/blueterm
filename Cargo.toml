@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/blueterm-proto", "crates/blueterm-agent", "crates/blueterm"]
+exclude = ["third_party"]
 
 [workspace.package]
 version = "1.0.0"
@@ -25,6 +26,10 @@ tracing = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1"
+
+# Lists D-Bus objects in a stable order; see third_party/dbus-crossroads/README.md.
+[patch.crates-io]
+dbus-crossroads = { path = "third_party/dbus-crossroads" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
